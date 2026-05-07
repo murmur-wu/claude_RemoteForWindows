@@ -44,19 +44,42 @@ Both bots share the same shape; the SDK and id semantics differ.
 
 Message flow on each incoming message:
 
-1. Whitelist check — telegram uses `chat_id`, discord uses `author.id`. In `bot.py` both are stored in a variable named `chat_id` so the rest of the code is identical.
-2. `usage_tracker.check_and_reserve` enforces RPM + daily-message caps atomically.
-3. A **per-chat `asyncio.Lock`** serializes requests for that chat — critical, because `--resume` races would corrupt session continuity.
+1. Whitelist check — telegram uses `chat_id`, discord uses `author.id`.
+2. `usage_tracker.check_and_reserve` enforces RPM + daily-message caps atomically (keyed on the user, not the conversation).
+3. A **per-conversation `asyncio.Lock`** serializes requests — critical, because `--resume` races would corrupt session continuity.
 4. `claude_runner.run` spawns `claude --print --output-format json [--resume <sid>] <prompt>` in the project's cwd, captures the JSON result.
 5. `session_store.set_session_id` persists the new `session_id` returned by claude — this is what makes the next message continue the same conversation.
 6. Output is chunked and delivered: 4000 chars on Telegram, 1900 on Discord.
 
-### Discord-specific notes
+### Discord trigger model + session keys
 
-- Uses `discord.ext.commands.Bot` with a configurable prefix (default `!`) plus an overridden `on_message` that routes prefix-starting messages to `process_commands` and everything else into the Claude pipeline.
-- Commands are registered as a single `RemoteCog`. The bot subclass owns the runtime state (`store`, `usage`, `runner`, `_chat_locks`, `_running`, `_cancelled`); the cog reaches into `self.bot` for those.
-- `intents.message_content = True` is mandatory; the matching toggle in the Dev Portal is also mandatory.
-- `async with channel.typing():` handles indicator keepalive automatically — no manual loop like in the Telegram bot.
+The discord bot has **three different keys** for what telegram bundles into `chat_id`:
+
+| concern | key | rationale |
+|---|---|---|
+| whitelist (`ALLOWED_USER_IDS`) | `author.id` | who is allowed to drive the bot |
+| usage caps (RPM, daily, cost) | `author.id` | quota protection is per-person |
+| session, lock, running/cancelled | `session_key` (see below) | each thread is an independent conversation |
+
+`session_key` is decided by `_session_key(channel, author_id)`:
+- `DMChannel` → `author.id`
+- `Thread`    → `channel.id`
+- regular guild channel → `None` (commands like `!cancel`/`!reset`/`!project` reject with a hint; the Claude pipeline opens a thread first via `message.create_thread()` and then uses the new thread's id)
+
+When does `_should_respond` fire?
+- DM: always
+- Bot-owned thread (`channel.owner_id == self.user.id`): always
+- Anywhere else: only when `self.user in message.mentions`
+
+`<@bot_id>` mentions are stripped from the prompt before being sent to Claude (`MENTION_RE` in `bot.py`).
+
+### Discord plumbing
+
+- `discord.ext.commands.Bot` subclass with prefix from `COMMAND_PREFIX` (default `!`); `on_message` is overridden to route prefix→`process_commands`, otherwise gate on `_should_respond`.
+- Commands are a single `RemoteCog`. The bot subclass owns the runtime state (`store`, `usage`, `runner`, `_chat_locks`, `_running`, `_cancelled`); the cog reaches into `self.bot` for those.
+- `intents.message_content = True` is mandatory in code; the matching toggle in the Dev Portal is also mandatory or `message.content` arrives empty.
+- `async with target.typing():` handles indicator keepalive automatically — no manual loop like in the Telegram bot.
+- Reply meta is rendered as `*turns=N · 2.8s · $0.0042*` (italic, joined with `·`); `num_turns` comes from claude's JSON `num_turns` field.
 
 ### Critical: `PERMISSION_MODE`
 

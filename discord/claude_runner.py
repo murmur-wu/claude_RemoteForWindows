@@ -23,6 +23,7 @@ class ClaudeResult:
     duration_ms: int | None
     raw: dict | None
     error: str | None = None
+    num_turns: int | None = None
 
 
 class ClaudeRunner:
@@ -115,4 +116,5 @@ class ClaudeRunner:
             cost_usd=payload.get("total_cost_usd"),
             duration_ms=payload.get("duration_ms"),
             raw=payload,
+            num_turns=payload.get("num_turns"),
         )
