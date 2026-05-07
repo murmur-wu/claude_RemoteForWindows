@@ -163,4 +163,4 @@ remotetools/
 
 ## License
 
-待定（之後補 `LICENSE` 檔）。
+[MIT](LICENSE) © 2026 murmur-wu
