@@ -1,12 +1,12 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本檔案為 Claude Code (claude.ai/code) 處理本 repo 時的指引。
 
-## Repository purpose
+## 專案目的
 
-Bridge that lets a phone (Telegram, soon Discord) send prompts to a `claude` CLI running on the user's Windows machine, then proxies the response back. Each chat gets a persistent Claude session, sandboxed per "project" (a working directory).
+讓手機（Telegram、Discord）把 prompt 送到本機運行的 `claude` CLI，再把回應送回手機。每段對話有獨立且持續存活的 Claude session，並可依 "project"（一個 working directory）切換。
 
-## Layout
+## 結構
 
 ```
 C:\claude\remotetools\
@@ -14,102 +14,102 @@ C:\claude\remotetools\
 └── discord\         discord.py, prefix !, msg limit 1900
 ```
 
-Each platform folder is a **self-contained Python app** with its own `.env`, `requirements.txt`, `.venv\`, and `state\`. The four core modules — `claude_runner.py`, `session_store.py`, `usage_tracker.py`, `keep_awake.py` — are **byte-identical copies** in both folders. Shared logic is **intentionally not extracted to a `core/` package** — duplication is currently cheap, and an abstraction would have to anticipate a third platform that may never exist. Re-evaluate if a third variant lands.
+每個平台資料夾都是 **獨立的 Python app**，各有自己的 `.env`、`requirements.txt`、`.venv\`、`state\`。四個共用模組——`claude_runner.py`、`session_store.py`、`usage_tracker.py`、`keep_awake.py`——在兩邊是 **byte-identical 的複製**。**刻意不抽到 `core/` 共用 package**——目前複製成本低，過早抽象會被迫去猜「可能永遠不會出現」的第三平台介面。等真的出現第三平台再評估。
 
-When fixing a bug in any of the four shared modules, update **both** copies. They drift only if you let them.
+修四個共用模組的任何 bug 時，**兩邊都要改**，否則只會 drift。
 
-## Run / develop
+## 執行 / 開發
 
-Both folders share the same launcher:
+兩個資料夾共用相同 launcher：
 
 ```powershell
-cd C:\claude\remotetools\telegram   # or \discord
-.\start.ps1                         # creates .venv on first run, installs deps, launches bot
+cd C:\claude\remotetools\telegram   # 或 \discord
+.\start.ps1                         # 首次跑會建 .venv、裝相依、啟動 bot
 ```
 
-`start.ps1` uses `$PSScriptRoot`, so it always builds `.venv\` next to itself. There is **no test suite, no linter, no build step** — just `python bot.py`.
+`start.ps1` 用 `$PSScriptRoot`，所以一定把 `.venv\` 建在自己旁邊。**沒有測試、沒有 linter、沒有 build step**——直接 `python bot.py`。
 
-`.env` must exist before launch (copy from `.env.example`). Required keys per platform:
+啟動前 `.env` 必須存在（從 `.env.example` 複製）。每平台必填 key：
 
-- **telegram**: `TELEGRAM_BOT_TOKEN`, `ALLOWED_CHAT_IDS`, `PROJECTS`, `DEFAULT_PROJECT`
-- **discord**: `DISCORD_BOT_TOKEN`, `ALLOWED_USER_IDS`, `PROJECTS`, `DEFAULT_PROJECT`
+- **telegram**：`TELEGRAM_BOT_TOKEN`、`ALLOWED_CHAT_IDS`、`PROJECTS`、`DEFAULT_PROJECT`
+- **discord**：`DISCORD_BOT_TOKEN`、`ALLOWED_USER_IDS`、`PROJECTS`、`DEFAULT_PROJECT`
 
-To discover your id: leave the allowlist empty, send any message to the bot, the rejection log prints the id.
+取得自己 id 的方法：把 allowlist 留空、傳任意訊息給 bot，rejection log 會印出 id。
 
-For Discord, the bot also needs `MESSAGE CONTENT INTENT` enabled in the [Developer Portal](https://discord.com/developers/applications) → Bot → Privileged Gateway Intents. Without it the bot connects but `message.content` arrives empty.
+Discord 還必須在 [Developer Portal](https://discord.com/developers/applications) → Bot → Privileged Gateway Intents 開啟 `MESSAGE CONTENT INTENT`。沒開的話 bot 連得上，但 `message.content` 一律會是空字串。
 
-## Architecture
+## 架構
 
-Both bots share the same shape; the SDK and id semantics differ.
+兩個 bot 形狀相同；SDK 與 id 語意不同。
 
-Message flow on each incoming message:
+每則訊息進來的流程：
 
-1. Whitelist check — telegram uses `chat_id`, discord uses `author.id`.
-2. `usage_tracker.check_and_reserve` enforces RPM + daily-message caps atomically (keyed on the user, not the conversation).
-3. A **per-conversation `asyncio.Lock`** serializes requests — critical, because `--resume` races would corrupt session continuity.
-4. `claude_runner.run` spawns `claude --print --output-format json [--resume <sid>] <prompt>` in the project's cwd, captures the JSON result.
-5. `session_store.set_session_id` persists the new `session_id` returned by claude — this is what makes the next message continue the same conversation.
-6. Output is chunked and delivered: 4000 chars on Telegram, 1900 on Discord.
+1. 白名單檢查——telegram 用 `chat_id`，discord 用 `author.id`。
+2. `usage_tracker.check_and_reserve` 原子地檢查 RPM + 每日訊息上限（key 在 user，不在 conversation）。
+3. **per-conversation 的 `asyncio.Lock`** 把同一段對話的請求序列化——關鍵防線，否則 `--resume` race 會弄壞 session 連續性。
+4. `claude_runner.run` 在 project 的 cwd 底下 spawn `claude --print --output-format json [--resume <sid>] <prompt>`，抓 JSON 結果。
+5. `session_store.set_session_id` 持久化 claude 回傳的新 `session_id`——下一則訊息能延續對話就靠這個。
+6. 輸出切片送出：Telegram 4000 字、Discord 1900 字。
 
-### Discord trigger model + session keys
+### Discord 觸發模型 + session keys
 
-The discord bot has **three different keys** for what telegram bundles into `chat_id`:
+discord bot 把 telegram 的單一 `chat_id` 拆成 **三組 key**：
 
-| concern | key | rationale |
+| 用途 | key | 理由 |
 |---|---|---|
-| whitelist (`ALLOWED_USER_IDS`) | `author.id` | who is allowed to drive the bot |
-| usage caps (RPM, daily, cost) | `author.id` | quota protection is per-person |
-| session, lock, running/cancelled | `session_key` (see below) | each thread is an independent conversation |
+| 白名單（`ALLOWED_USER_IDS`） | `author.id` | 誰能驅動 bot |
+| 用量上限（RPM、每日、成本） | `author.id` | 配額保護是 per-person |
+| session、lock、running/cancelled | `session_key`（見下） | 每個 thread 是獨立對話 |
 
-`session_key` is decided by `_session_key(channel, author_id)`:
+`session_key` 由 `_session_key(channel, author_id)` 決定：
 - `DMChannel` → `author.id`
 - `Thread`    → `channel.id`
-- regular guild channel → `None` (commands like `!cancel`/`!reset`/`!project` reject with a hint; the Claude pipeline opens a thread first via `message.create_thread()` and then uses the new thread's id)
+- 一般 guild channel → `None`（`!cancel`/`!reset`/`!project` 等指令會 reject 並提示；Claude pipeline 會先用 `message.create_thread()` 開 thread，再用新 thread 的 id 當 session_key）
 
-When does `_should_respond` fire?
-- DM: always
-- Bot-owned thread (`channel.owner_id == self.user.id`): always
-- Anywhere else: only when `self.user in message.mentions`
+`_should_respond` 何時觸發？
+- DM：永遠
+- bot 自己建的 thread（`channel.owner_id == self.user.id`）：永遠
+- 其他地方：僅當 `self.user in message.mentions`
 
-`<@bot_id>` mentions are stripped from the prompt before being sent to Claude (`MENTION_RE` in `bot.py`).
+`<@bot_id>` mention 會在 prompt 送進 Claude 前剝掉（`bot.py` 的 `MENTION_RE`）。
 
-### Discord plumbing
+### Discord 細節
 
-- `discord.ext.commands.Bot` subclass with prefix from `COMMAND_PREFIX` (default `!`); `on_message` is overridden to route prefix→`process_commands`, otherwise gate on `_should_respond`.
-- Commands are a single `RemoteCog`. The bot subclass owns the runtime state (`store`, `usage`, `runner`, `_chat_locks`, `_running`, `_cancelled`); the cog reaches into `self.bot` for those.
-- `intents.message_content = True` is mandatory in code; the matching toggle in the Dev Portal is also mandatory or `message.content` arrives empty.
-- `async with target.typing():` handles indicator keepalive automatically — no manual loop like in the Telegram bot.
-- Reply meta is rendered as `*turns=N · 2.8s · $0.0042*` (italic, joined with `·`); `num_turns` comes from claude's JSON `num_turns` field.
+- `discord.ext.commands.Bot` 的 subclass，prefix 來自 `COMMAND_PREFIX`（預設 `!`）；`on_message` 被 override 來路由 prefix→`process_commands`，否則經 `_should_respond` 判斷。
+- 所有指令集中在 `RemoteCog`。Bot subclass 持有 runtime state（`store`、`usage`、`runner`、`_chat_locks`、`_running`、`_cancelled`）；cog 透過 `self.bot` 拿。
+- `intents.message_content = True` 在 code 是必須；Dev Portal 對應 toggle 也必須打開，否則 `message.content` 永遠是空字串。
+- `async with target.typing():` 自動處理 typing indicator keepalive——不像 Telegram 那邊得手動 loop。
+- 回覆 meta 渲染成 `*turns=N · 2.8s · $0.0042*`（italic、`·` 連接）；`num_turns` 來自 claude JSON 的 `num_turns` 欄位。
 
-### Critical: `PERMISSION_MODE`
+### 重要：`PERMISSION_MODE`
 
-The bot has no stdin attached to claude. **Only `auto` and `bypassPermissions` work.** `default` and `acceptEdits` will hang forever waiting for an interactive prompt nobody can answer. The `.env.example` documents this; preserve those comments if editing.
+bot 沒有把 stdin 接到 claude。**只有 `auto` 跟 `bypassPermissions` 可用。** `default` 跟 `acceptEdits` 會永遠卡在等 interactive prompt（沒人能回答）。`.env.example` 有記載這件事；編輯時請保留那些註解。
 
-### Why `usage_tracker.py` exists
+### `usage_tracker.py` 為什麼存在
 
-Not just rate limiting — it protects the user's Claude Max **5-hour quota**. Automation calls claude faster than humans; a runaway loop or spam can burn the daily quota in 30 minutes. Don't remove `DAILY_MESSAGE_LIMIT` or `RATE_LIMIT_PER_MINUTE` enforcement without explicit user instruction.
+不只是 rate limit——它保護用戶的 Claude Max **5 小時配額**。自動化呼叫 claude 比人手快很多；一個失控 loop 或被洗版能在 30 分鐘內燒完每日配額。**沒有明確指示時不要拿掉** `DAILY_MESSAGE_LIMIT` 或 `RATE_LIMIT_PER_MINUTE` 的執行。
 
 ### `keep_awake.py`
 
-Calls Win32 `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` so Windows doesn't sleep mid-request. No-op on non-Windows. Per-process — exits cleanly when the bot dies.
+呼叫 Win32 `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`，避免 Windows 在請求中途睡眠。非 Windows 平台 no-op。Per-process——bot 死了就乾淨退回正常 sleep 行為。
 
-### Cancel / reset semantics
+### Cancel / reset 語意
 
-- `/cancel` kills the live `claude` subprocess via `_running[chat_id].kill()` and marks the chat in `_cancelled` so the result is discarded instead of delivered.
-- `/reset` and `/project <name>` both **null out the stored `session_id`** — the next message starts a fresh claude conversation.
+- `/cancel`（discord 是 `!cancel`）會用 `_running[key].kill()` 殺掉正在跑的 `claude` subprocess，並把該對話標進 `_cancelled`，讓結果直接丟掉、不送出。
+- `/reset` 跟 `/project <name>` 都會 **把存好的 `session_id` 清成 None**——下一則訊息開全新 claude 對話。
 
-### State files
+### State 檔
 
-- `telegram\state\sessions.json` — `{chat_id: {session_id, project}}`, written via tmp-file rename.
-- `telegram\state\usage.json` — daily message counts and cost totals, auto-resets on date change.
-- Both gitignored (root `.gitignore` uses `**/state/*.json` to cover future platform folders).
+- `telegram\state\sessions.json`——`{chat_id: {session_id, project}}`，用 tmp file rename 寫入。
+- `telegram\state\usage.json`——每日訊息數、累計成本，依日期自動 reset。
+- 兩個都被 gitignored（root `.gitignore` 用 `**/state/*.json` 涵蓋所有平台資料夾）。
 
-## Adding a third platform
+## 加第三個平台時
 
-If a third variant ever appears, that's the trigger to extract `core/` (housing `claude_runner`, `session_store`, `usage_tracker`, `keep_awake`). Until then, copy-paste from either folder is the rule.
+真的出現第三個平台，就是抽 `core/`（容納 `claude_runner`、`session_store`、`usage_tracker`、`keep_awake`）的時機。在那之前，從任一邊複製貼上即可。
 
-## User context
+## 用戶資訊
 
-- User communicates in 繁體中文; technical terms / code / logs stay English.
-- Primary shell is PowerShell on Windows 11. Use PowerShell syntax (`$env:VAR`, not `$VAR`) when suggesting commands.
-- Common target project this bot drives: `C:\Web\OnlinePrint-Production` (configured via `PROJECTS=` in `.env`).
+- 用戶以繁體中文溝通；技術詞 / code / log 保留英文。
+- 主要 shell 是 Windows 11 的 PowerShell。建議命令請用 PowerShell 語法（`$env:VAR`，不是 `$VAR`）。
+- 此 bot 常驅動的目標 project：`C:\Web\OnlinePrint-Production`（在 `.env` 的 `PROJECTS=` 設定）。
