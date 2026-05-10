@@ -5,3 +5,5 @@
 **/state/*.json
 **/state/*.json.tmp
 **/state/*.log
+services/nssm.exe
+services/logs/
