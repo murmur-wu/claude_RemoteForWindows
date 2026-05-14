@@ -91,17 +91,17 @@ copy .env.example .env
 `ALLOWED_CHAT_IDS` / `ALLOWED_USER_IDS` 留空 = bot 拒絕所有人（fail-closed），這是預設且推薦的行為。**永遠不要**為了「方便測試」把白名單關掉。
 
 ### 2. `PERMISSION_MODE` 只能用 `auto` 或 `bypassPermissions`
-Bot 沒有 stdin，無法回應 claude 的權限詢問：
+Bot 沒有 stdin，無法回應 claude 的權限詢問；手機端也沒人能按 `/permissions Always Allow` 補 allow 規則：
 
 | 模式 | 結果 |
 |---|---|
 | `default` | bot 卡死等 stdin |
 | `acceptEdits` | 編輯自動過，但 bash 會卡死等 stdin |
-| `auto` | ✅ 推薦。搭配 `~/.claude/settings.json` 的 deny 黑名單擋危險指令 |
-| `bypassPermissions` | ⚠️ 全綠燈，連 deny 規則都跳過 |
+| `auto` | 依 `~/.claude/settings.json` 的 allow 表決定。**未授權的目錄/工具會被擋**（claude 回 permission_denied、整個請求失敗）；適合 allow 表已備齊的情境 |
+| `bypassPermissions` | ✅ 推薦給手機遠端。全綠燈，連 deny 規則都跳過——前提是 `ALLOWED_USER_IDS` 鎖好、裝置可信 |
 
-### 3. 用 `~/.claude/settings.json` 的 deny 規則做最後防線
-即使 `PERMISSION_MODE=auto`，settings 裡仍可以擋特定 bash pattern（如 `rm -rf /`、`curl ... | sh`、`shutdown` 等等）。Bot 用了它的權限模型，但你決定能跑什麼。
+### 3. 用 `~/.claude/settings.json` 的 deny 規則做最後防線（僅 `auto` 模式有效）
+`auto` 下 settings 仍能擋特定 bash pattern（`rm -rf /`、`curl ... | sh`、`shutdown` 等）。**`bypassPermissions` 連 deny 都會跳過**——選 bypass 就等於把信任邊界完全推到 `ALLOWED_USER_IDS` 白名單上。
 
 ### 4. Claude Max 配額保護
 `DAILY_MESSAGE_LIMIT`（預設 100）跟 `RATE_LIMIT_PER_MINUTE`（預設 6）不是反垃圾訊息——是防自己手抖或腳本爆走把 5 小時配額在半小時內燒掉。**沒有強烈理由不要關**。

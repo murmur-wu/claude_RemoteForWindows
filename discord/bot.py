@@ -20,6 +20,7 @@ import asyncio
 import logging
 import re
 from collections import defaultdict
+from pathlib import Path
 
 import discord
 from discord.ext import commands
@@ -33,13 +34,30 @@ from usage_tracker import UsageTracker
 DISCORD_MSG_LIMIT = 1900  # 2000 hard cap; leave headroom for meta + edits
 THREAD_NAME_LIMIT = 95    # discord caps at 100
 THREAD_AUTO_ARCHIVE_MIN = 1440  # 24h
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # Discord 一般用戶上限
 MENTION_RE = re.compile(r"<@!?\d+>")
+UNSAFE_FILENAME_RE = re.compile(r"[^\w.\-]")
 
 log = logging.getLogger("remotetools")
 
 
 def _strip_mentions(text: str) -> str:
     return MENTION_RE.sub("", text).strip()
+
+
+def _safe_filename(name: str) -> str:
+    cleaned = UNSAFE_FILENAME_RE.sub("_", name).strip("._")
+    return cleaned or "file"
+
+
+def _augment_prompt_with_attachments(prompt: str, paths: list[Path]) -> str:
+    if not paths:
+        return prompt
+    listing = "\n".join(f"- {p}" for p in paths)
+    block = f"[Discord 附件已下載到本機，請依需求用 Read 工具讀取：\n{listing}\n]"
+    if prompt:
+        return f"{prompt}\n\n{block}"
+    return f"使用者只傳了附件、沒附文字。請先讀取下列檔案再回覆。\n\n{block}"
 
 
 def _session_key(channel: discord.abc.Messageable, author_id: int) -> int | None:
@@ -93,6 +111,8 @@ class RemoteCog(commands.Cog):
             f"`{p}project <name>` - 切換專案（會清空當前 session）\n"
             f"`{p}cancel` - 取消當前正在執行的請求\n"
             f"`{p}reset` - 清空 session，下一則訊息開新對話\n"
+            f"`{p}retry` - 重跑上一則 prompt（會清掉 session 開新對話）\n"
+            f"`{p}model [name]` - 顯示/切換模型（opus/sonnet/haiku 或完整 ID；`default` 回 .env 預設）\n"
             f"`{p}help` - 顯示此說明"
         )
 
@@ -143,9 +163,11 @@ class RemoteCog(commands.Cog):
             state = self.bot.store.get(sk, self.bot.cfg.default_project)
             sid = state.session_id or "（未建立，下一則訊息會開新對話）"
             path = self.bot.cfg.projects.get(state.project, "?")
+            model = state.model or self.bot.cfg.claude_model or "(CLI 預設)"
             session_block = (
                 f"專案: **{state.project}**\n"
                 f"路徑: `{path}`\n"
+                f"模型: `{model}`\n"
                 f"session: `{sid}`\n"
             )
 
@@ -221,6 +243,64 @@ class RemoteCog(commands.Cog):
         self.bot.store.reset(sk)
         await ctx.reply("Session 已清空。下一則訊息開新對話。")
 
+    @commands.command(name="retry")
+    async def cmd_retry(self, ctx: commands.Context) -> None:
+        if await self._reject_unknown(ctx):
+            return
+        sk = await self._require_session(ctx)
+        if sk is None:
+            return
+        state = self.bot.store.get(sk, self.bot.cfg.default_project)
+        if not state.last_prompt:
+            await ctx.reply("沒有上一則 prompt 可重跑。")
+            return
+        self.bot.store.reset(sk)
+        await self.bot._run_prompt(
+            target=ctx.channel,
+            session_key=sk,
+            user_id=ctx.author.id,
+            prompt=state.last_prompt,
+        )
+
+    @commands.command(name="model")
+    async def cmd_model(self, ctx: commands.Context, name: str | None = None) -> None:
+        if await self._reject_unknown(ctx):
+            return
+        sk = await self._require_session(ctx)
+        if sk is None:
+            return
+        if name is None:
+            state = self.bot.store.get(sk, self.bot.cfg.default_project)
+            effective = state.model or self.bot.cfg.claude_model or "(claude CLI 預設)"
+            source = (
+                "session override" if state.model
+                else ".env" if self.bot.cfg.claude_model
+                else "CLI 預設"
+            )
+            p = self.bot.cfg.command_prefix
+            await ctx.reply(
+                f"當前模型：`{effective}`（來源：{source}）\n"
+                f"切換：`{p}model <opus|sonnet|haiku|claude-...>`\n"
+                f"重置回 .env 設定：`{p}model default`"
+            )
+            return
+        name_norm = name.strip().lower()
+        if name_norm in ("default", "reset", "clear", "-"):
+            self.bot.store.set_model(sk, None)
+            fallback = self.bot.cfg.claude_model or "(claude CLI 預設)"
+            await ctx.reply(f"已重置模型為 .env 設定：`{fallback}`")
+            return
+        if not (name_norm in ("opus", "sonnet", "haiku") or name_norm.startswith("claude-")):
+            await ctx.reply(
+                f"無效的模型名稱 `{name}`。請用 opus / sonnet / haiku，"
+                f"或完整 ID（`claude-...`）。"
+            )
+            return
+        self.bot.store.set_model(sk, name_norm)
+        await ctx.reply(
+            f"已切換到 `{name_norm}`（session 保留，下次呼叫起套用）"
+        )
+
 
 class RemoteBot(commands.Bot):
     def __init__(self, cfg: Config) -> None:
@@ -276,6 +356,36 @@ class RemoteBot(commands.Bot):
             return
         await self._handle_claude(message)
 
+    async def _save_attachments(
+        self, message: discord.Message, session_key: int
+    ) -> tuple[list[Path], list[str]]:
+        """Download attachments to state/uploads/<session_key>/.
+
+        Returns (saved_absolute_paths, user_visible_warnings).
+        """
+        if not message.attachments:
+            return [], []
+        base = self.cfg.state_dir / "uploads" / str(session_key)
+        base.mkdir(parents=True, exist_ok=True)
+        saved: list[Path] = []
+        warnings: list[str] = []
+        for att in message.attachments:
+            if att.size > MAX_ATTACHMENT_BYTES:
+                warnings.append(
+                    f"略過 `{att.filename}`：{att.size / 1024 / 1024:.1f} MB 超過 "
+                    f"{MAX_ATTACHMENT_BYTES // 1024 // 1024} MB 上限"
+                )
+                continue
+            path = (base / f"{message.id}_{_safe_filename(att.filename)}").resolve()
+            try:
+                await att.save(path)
+            except (discord.HTTPException, OSError) as e:
+                log.warning("attachment save failed for %s: %s", att.filename, e)
+                warnings.append(f"下載 `{att.filename}` 失敗：{e}")
+                continue
+            saved.append(path)
+        return saved, warnings
+
     async def _resolve_target(
         self, message: discord.Message, prompt: str
     ) -> tuple[discord.abc.Messageable, int]:
@@ -311,11 +421,27 @@ class RemoteBot(commands.Bot):
             return
 
         prompt = _strip_mentions(message.content)
-        if not prompt:
+        if not prompt and not message.attachments:
             return
 
-        target, session_key = await self._resolve_target(message, prompt)
+        target, session_key = await self._resolve_target(message, prompt or "Attachment")
+        await self._run_prompt(
+            target=target,
+            session_key=session_key,
+            user_id=user_id,
+            prompt=prompt,
+            attachments_source=message,
+        )
 
+    async def _run_prompt(
+        self,
+        target: discord.abc.Messageable,
+        session_key: int,
+        user_id: int,
+        prompt: str,
+        *,
+        attachments_source: discord.Message | None = None,
+    ) -> None:
         check = self.usage.check_and_reserve(user_id)
         if not check.ok:
             if check.reason == "rate":
@@ -333,7 +459,37 @@ class RemoteBot(commands.Bot):
             state = self.store.get(session_key, self.cfg.default_project)
             cwd = self.cfg.projects[state.project]
 
-            placeholder = await target.send(f"執行中… ({state.project})")
+            header = f"執行中… ({state.project})"
+            placeholder = await target.send(header)
+
+            attachments: list[Path] = []
+            if attachments_source is not None:
+                attachments, attach_warnings = await self._save_attachments(
+                    attachments_source, session_key
+                )
+                for w in attach_warnings:
+                    try:
+                        await target.send(f"⚠️ {w}")
+                    except discord.HTTPException as e:
+                        log.warning("attachment warning send failed: %s", e)
+
+            full_prompt = _augment_prompt_with_attachments(prompt, attachments)
+            if not full_prompt.strip():
+                await placeholder.edit(
+                    content="沒有可送出的內容（檔案皆失敗或超過上限）。"
+                )
+                return
+
+            if prompt:
+                self.store.set_last_prompt(session_key, prompt)
+
+            async def _on_update(snapshot: str) -> None:
+                content = snapshot if len(snapshot) <= DISCORD_MSG_LIMIT \
+                    else snapshot[:DISCORD_MSG_LIMIT - 1] + "…"
+                try:
+                    await placeholder.edit(content=content)
+                except discord.HTTPException as e:
+                    log.warning("progress edit failed: %s", e)
 
             def _on_started(p: asyncio.subprocess.Process) -> None:
                 self._running[session_key] = p
@@ -341,10 +497,13 @@ class RemoteBot(commands.Bot):
             try:
                 async with target.typing():
                     result = await self.runner.run(
-                        prompt=prompt,
+                        prompt=full_prompt,
                         cwd=cwd,
                         resume_session_id=state.session_id,
                         on_started=_on_started,
+                        on_update=_on_update,
+                        update_header=header,
+                        model_override=state.model,
                     )
             finally:
                 self._running.pop(session_key, None)
@@ -371,6 +530,15 @@ class RemoteBot(commands.Bot):
         result: ClaudeResult,
     ) -> None:
         if not result.ok:
+            if result.context_overflow:
+                p = self.cfg.command_prefix
+                await placeholder.edit(
+                    content=(
+                        "⚠️ 對話累積已超過 context 上限，claude 拒絕了這則 prompt。\n"
+                        f"用 `{p}reset` 開新對話，或 `{p}retry` 自動 reset 並重跑同一個 prompt。"
+                    )
+                )
+                return
             await placeholder.edit(
                 content=f"錯誤：\n{result.error}"[:DISCORD_MSG_LIMIT]
             )

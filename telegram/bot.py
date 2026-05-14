@@ -8,6 +8,7 @@ from html import escape as html_escape
 
 from telegram import BotCommand, Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,12 +18,14 @@ from telegram.ext import (
 )
 
 BOT_COMMANDS = [
-    BotCommand("status", "顯示 session / 專案 / 今日用量"),
+    BotCommand("status", "顯示 session / 專案 / 模型 / 今日用量"),
     BotCommand("usage", "只顯示今日用量"),
     BotCommand("projects", "列出可用專案"),
     BotCommand("project", "切換專案，用法: /project <name>"),
+    BotCommand("model", "顯示/切換模型，用法: /model [name|default]"),
     BotCommand("cancel", "取消當前執行中的請求"),
     BotCommand("reset", "清空 session，下一則訊息開新對話"),
+    BotCommand("retry", "重跑上一則 prompt（會清掉 session 開新對話）"),
     BotCommand("help", "顯示指令說明"),
 ]
 
@@ -87,12 +90,14 @@ class Bot:
         await update.message.reply_text(
             "Claude Code 遠端控制 bot 啟動。\n"
             "傳訊息 = 直接送給 Claude。指令：\n"
-            "/status - session / 專案 / 今日用量\n"
+            "/status - session / 專案 / 模型 / 今日用量\n"
             "/usage - 只看今日用量\n"
             "/projects (/list) - 列出可用專案\n"
             "/project <name> - 切換專案（會清空當前 session）\n"
+            "/model [name] - 顯示/切換模型（opus/sonnet/haiku 或 claude-...；`default` 回 .env 設定）\n"
             "/cancel - 取消當前正在執行的請求\n"
             "/reset - 清空 session，下一則訊息開新對話\n"
+            "/retry - 重跑上一則 prompt（會清掉 session 開新對話）\n"
             "/help - 顯示此說明"
         )
 
@@ -135,6 +140,7 @@ class Bot:
         snap = self.usage.snapshot(chat_id)
         sid = state.session_id or "（未建立，下一則訊息會開新對話）"
         path = self.cfg.projects.get(state.project, "?")
+        model = state.model or self.cfg.claude_model or "(CLI 預設)"
 
         if snap.daily_limit > 0:
             daily_line = f"今日訊息: <b>{snap.messages}</b> / {snap.daily_limit}"
@@ -151,6 +157,7 @@ class Bot:
             f"chat_id: <code>{chat_id}</code>\n"
             f"專案: <b>{html_escape(state.project)}</b>\n"
             f"路徑: <code>{html_escape(str(path))}</code>\n"
+            f"模型: <code>{html_escape(model)}</code>\n"
             f"session: <code>{html_escape(str(sid))}</code>\n"
             f"權限模式: <code>{html_escape(self.cfg.permission_mode)}</code>\n"
             f"\n"
@@ -160,6 +167,55 @@ class Bot:
             f"今日累計: <b>${snap.cost_usd:.4f}</b>（Max 配額代理指標）",
             parse_mode=ParseMode.HTML,
         )
+
+    async def cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._reject_unknown(update):
+            return
+        chat_id = update.effective_chat.id
+        if not ctx.args:
+            state = self.store.get(chat_id, self.cfg.default_project)
+            effective = state.model or self.cfg.claude_model or "(claude CLI 預設)"
+            source = (
+                "session override" if state.model
+                else ".env" if self.cfg.claude_model
+                else "CLI 預設"
+            )
+            await update.message.reply_text(
+                f"當前模型：<code>{html_escape(effective)}</code>（來源：{source}）\n"
+                f"切換：<code>/model &lt;opus|sonnet|haiku|claude-...&gt;</code>\n"
+                f"重置回 .env 設定：<code>/model default</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        name_norm = ctx.args[0].strip().lower()
+        if name_norm in ("default", "reset", "clear", "-"):
+            self.store.set_model(chat_id, None)
+            fallback = self.cfg.claude_model or "(claude CLI 預設)"
+            await update.message.reply_text(
+                f"已重置模型為 .env 設定：{fallback}"
+            )
+            return
+        if not (name_norm in ("opus", "sonnet", "haiku") or name_norm.startswith("claude-")):
+            await update.message.reply_text(
+                f"無效的模型名稱 {name_norm!r}。請用 opus / sonnet / haiku，"
+                f"或完整 ID（claude-...）。"
+            )
+            return
+        self.store.set_model(chat_id, name_norm)
+        await update.message.reply_text(
+            f"已切換到 {name_norm}（session 保留，下次呼叫起套用）"
+        )
+
+    async def cmd_retry(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._reject_unknown(update):
+            return
+        chat_id = update.effective_chat.id
+        state = self.store.get(chat_id, self.cfg.default_project)
+        if not state.last_prompt:
+            await update.message.reply_text("沒有上一則 prompt 可重跑。")
+            return
+        self.store.reset(chat_id)
+        await self._run_prompt(update, ctx, chat_id, state.last_prompt)
 
     async def cmd_usage(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if await self._reject_unknown(update):
@@ -209,14 +265,22 @@ class Bot:
 
     # ---------- main message flow ----------
 
-    async def on_message(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if await self._reject_unknown(update):
             return
         chat_id = update.effective_chat.id
         prompt = (update.message.text or "").strip()
         if not prompt:
             return
+        await self._run_prompt(update, ctx, chat_id, prompt)
 
+    async def _run_prompt(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        prompt: str,
+    ) -> None:
         check = self.usage.check_and_reserve(chat_id)
         if not check.ok:
             if check.reason == "rate":
@@ -235,12 +299,28 @@ class Bot:
             cwd = self.cfg.projects[state.project]
 
             await update.effective_chat.send_action(ChatAction.TYPING)
-            placeholder = await update.message.reply_text(
-                f"執行中… ({state.project})"
-            )
+            header = f"執行中… ({state.project})"
+            placeholder = await update.message.reply_text(header)
 
-            # Keep the typing indicator alive while claude runs.
-            keepalive = asyncio.create_task(self._keep_typing(update.effective_chat.id, _ctx))
+            self.store.set_last_prompt(chat_id, prompt)
+
+            keepalive = asyncio.create_task(self._keep_typing(update.effective_chat.id, ctx))
+
+            last_rendered: list[str] = [""]
+
+            async def _on_update(snapshot: str) -> None:
+                content = snapshot if len(snapshot) <= TELEGRAM_MSG_LIMIT \
+                    else snapshot[:TELEGRAM_MSG_LIMIT - 1] + "…"
+                if content == last_rendered[0]:
+                    return
+                last_rendered[0] = content
+                try:
+                    await placeholder.edit_text(content)
+                except BadRequest as e:
+                    if "not modified" not in str(e).lower():
+                        log.warning("progress edit failed: %s", e)
+                except Exception as e:
+                    log.warning("progress edit failed: %s", e)
 
             def _on_started(p: asyncio.subprocess.Process) -> None:
                 self._running[chat_id] = p
@@ -251,6 +331,9 @@ class Bot:
                     cwd=cwd,
                     resume_session_id=state.session_id,
                     on_started=_on_started,
+                    on_update=_on_update,
+                    update_header=header,
+                    model_override=state.model,
                 )
             finally:
                 keepalive.cancel()
@@ -289,6 +372,12 @@ class Bot:
         result: ClaudeResult,
     ) -> None:
         if not result.ok:
+            if result.context_overflow:
+                await placeholder.edit_text(
+                    "⚠️ 對話累積已超過 context 上限，claude 拒絕了這則 prompt。\n"
+                    "用 /reset 開新對話，或 /retry 自動 reset 並重跑同一個 prompt。"
+                )
+                return
             await placeholder.edit_text(f"錯誤：\n{result.error}"[:TELEGRAM_MSG_LIMIT])
             return
 
@@ -366,8 +455,10 @@ def main() -> None:
     app.add_handler(CommandHandler("project", bot.cmd_project))
     app.add_handler(CommandHandler("status", bot.cmd_status))
     app.add_handler(CommandHandler("usage", bot.cmd_usage))
+    app.add_handler(CommandHandler("model", bot.cmd_model))
     app.add_handler(CommandHandler("cancel", bot.cmd_cancel))
     app.add_handler(CommandHandler("reset", bot.cmd_reset))
+    app.add_handler(CommandHandler("retry", bot.cmd_retry))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.on_message))
     app.add_error_handler(bot.on_error)
 
