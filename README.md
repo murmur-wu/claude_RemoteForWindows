@@ -161,6 +161,43 @@ remotetools/
 - 想看 claude 實際被怎麼呼叫：`claude_runner.py` 的 `args` list，可以印出來除錯。
 - bot 在跑的時候，Windows 不會進入睡眠（`KeepAwake`），但螢幕還是會關。
 
+## GitHub 自動發版
+
+repo 內建兩條 GitHub Actions workflow：
+
+- PR 到 `main` 時跑 `PR Check`，只做驗證，不發版
+- 變更真的進到 `main` 時跑 `Release`，自動建立版本、打包 zip、建立 GitHub Release
+
+### 觸發規則
+
+- `pull_request -> main`：檢查 Python 語法、驗證版號腳本可執行
+- `push -> main`：依 commit 訊息推算下一個 semver 版本，建立 tag 與 release
+
+### 版號規則
+
+`Release` workflow 會看上一個 `v*` tag 之後的 commit 訊息：
+
+- 有 `BREAKING CHANGE` 或 `type!:` → `major`
+- 有 `feat:` → `minor`
+- 其他情況 → `patch`
+
+例如：
+
+- `fix: handle discord DM lock cleanup` → patch
+- `feat: add attachment download warnings` → minor
+- `feat!: change session key format` → major
+
+### 產物
+
+每次 release 會附上這些 zip：
+
+- 完整原始碼包：`remotetools-<version>-source.zip`
+- Telegram 部署包：`remotetools-<version>-telegram.zip`
+- Discord 部署包：`remotetools-<version>-discord.zip`
+- Windows service 腳本包：`remotetools-<version>-services.zip`
+
+打包時會排除 `.venv`、`state` 執行檔案、service logs 與 `nssm.exe`。
+
 ## License
 
 [MIT](LICENSE) © 2026 murmur-wu
