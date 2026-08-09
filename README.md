@@ -4,6 +4,12 @@
 
 > **使用情境**：人在外面突然想到「啊，那個專案的 README 要加一段」，掏手機傳訊息給 bot，家裡電腦的 Claude Code 自動 commit。
 
+📖 **設計說明系列文**（為什麼這樣做、內部怎麼運作、怎麼部署）：
+
+- [用手機遠端指揮家裡的 Claude Code](https://murmurpaper.heitang.info/2026/08/08/remotetools-intro/) — 專案在解決什麼問題、能做什麼
+- [底層邏輯拆解](https://murmurpaper.heitang.info/2026/08/08/remotetools-internals/) — 訊息生命週期、session 管理、streaming、並發防護
+- [部署教學](https://murmurpaper.heitang.info/2026/08/08/remotetools-deploy/) — 從零架起來，含 Windows 服務化
+
 ```
 你 (📱)  ──訊息──▶  Telegram / Discord  ──polling──▶  bot.py  ──subprocess──▶  claude --print
                                                          ▲                          │
